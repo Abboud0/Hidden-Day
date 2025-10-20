@@ -1,6 +1,7 @@
 "use client";
-import { useState } from "react";
+import React, { useState } from "react";
 import MapView from "./MapView";
+import { it } from "node:test";
 
 export default function UserForm() {
     const [formData, setFormData] = useState({
@@ -19,24 +20,23 @@ export default function UserForm() {
         setFormData({ ...formData, [name]: value });
     }
 
-    function handleSubmit(e: React.FormEvent) {
+    async function handleSubmit(e: React.FormEvent) {
         e.preventDefault();
 
-        // 🎯 simple mock itinerary generator
-        const sampleActivities = [
-            "☕ Morning coffee at a local cafe",
-            "🏞️ Visit a park nearby",
-            "🍝 Lunch at a cozy restaurant",
-            "🖼️ Explore a local museum or art gallery",
-            "🌇 Evening walk downtown JAX",
-            "🍽️ Dinner with a view of the river",
-        ];
+        const res = await fetch("/api/plan", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(formData),
+        });
 
-        const fakePlan = sampleActivities
-            .slice(0, 4)
-            .map((act) => `${act} (${formData.location})`);
+        const data = await res.json();
+        if (!res.ok) {
+            alert(data.error ?? "Failed to generate plan.");
+            return;
+        }
 
-        setPlan(fakePlan);
+        // display list + pass titles to UI list
+        setPlan(data.items.map((it: any) => it.title + ` (${formData.location})`));
     }
 
     return (
