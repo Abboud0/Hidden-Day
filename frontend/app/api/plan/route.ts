@@ -1,4 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
+import { flightRouterStateSchema } from "next/dist/server/app-render/types";
 import { NextRequest } from "next/server";
 
 export const runtime = "nodejs";
@@ -11,8 +12,11 @@ type PlanItem = {
     title: string;
     lat: number;
     lon: number;
-    source?: "yelp" | "eventbrite" | "google" | "fallback";
+    source?: "yelp" | "eventbrite" | "google" | "fallback" | "event";
     url?: string;
+    venue?: string;
+    address?: string;
+    whenISO?: string;
 };
 
 type PlanResponse = {
@@ -32,6 +36,16 @@ type PlanResponse = {
 type CacheEntry = { expires: number; data: PlanResponse };
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 mins
 const cache = new Map<string, CacheEntry>();
+
+/** --------------------
+ * Feature flags and env
+ * ---------------------
+ */
+const EB_ENABLED =
+    process.env.EB_ENABLE !== "0" &&
+    process.env.EB_ENABLE?.toLowerCase?.() !== "false";
+
+const TICKETMASTER_API_KEY = process.env.TICKETMASTER_API_KEY || "";
 
 /** Helpers for responses */
 function ok<T>(data: T, status = 200) {
@@ -73,7 +87,7 @@ function dedupe(items: PlanItem[]) {
 
 /** lightweight ranking: prefer real providers over fallback */
 function rank(items: PlanItem[], limit = 12) {
-    const weight: Record<string, number> = { google: 3, yelp: 2, eventbrite: 2, fallback: 1 };
+    const weight: Record<string, number> = { google: 3, yelp: 2, eventbrite: 2, event: 2, fallback: 1 };
     return items
         .map(i => ({ i, s: (weight[i.source ?? "fallback"] ?? 0) + Math.random() * 0.2 }))
         .sort((a, b) => b.s - a.s)
@@ -109,6 +123,11 @@ function buildWindow(dateISO: string, timeframe: "day" | "weekend" | "week" | "c
     const monday = new Date(d); monday.setDate(d.getDate() - ((dow + 6) % 7)); monday.setHours(0, 0, 0, 0);
     const sunday = new Date(monday); sunday.setDate(monday.getDate() + 6); sunday.setHours(23, 59, 59, 999);
     return { start: monday, end: sunday };
+}
+
+/** format for Ticketmaster (strip milliseconds) */
+function tmDateString(dt: Date) {
+    return dt.toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
 /** --------------------------------------------------
@@ -258,6 +277,79 @@ async function fetchEventbrite(
     return items;
 }
 
+/** ------------------------------------
+ * Ticketmaster Discovery (read-only)
+ *  - keyword: first interest term (e.g., "concert")
+ *  - latlong, radius=25 (miles), time window, sort=date,asc, size=30
+ * ------------------------------------- 
+ */
+async function fetchTicketmaster(
+    center: [number, number],
+    start: Date,
+    end: Date,
+    interests: string
+): Promise<PlanItem[]> {
+    if (!TICKETMASTER_API_KEY) return [];
+
+    const [lat, lon] = center;
+    const keyword = (interests || "").split(",")[0]?.trim() || "";
+
+    const url = new URL("https://app.ticketmaster.com/discovery/v2/events.json");
+    url.searchParams.set("apikey", TICKETMASTER_API_KEY);
+    if (keyword) url.searchParams.set("keyword", keyword);
+    url.searchParams.set("latlong", `${lat},${lon}`);
+    url.searchParams.set("radius", "25");
+    url.searchParams.set("unit", "miles");
+    url.searchParams.set("startDateTime", tmDateString(start));
+    url.searchParams.set("endDateTime", tmDateString(end));
+    url.searchParams.set("sort", "date,asc");
+    url.searchParams.set("size", "30");
+
+    const res = await fetch(url.toString(), {
+        headers: {
+            "User-Agent": "HiddenDay/0.1",
+            "Accept": "application/json",
+        },
+    });
+    if (!res.ok) {
+        console.warn("[ticketmaster] non-200:", res.status);
+        return [];
+    }
+
+    const js = await res.json();
+    const events: any[] = js?._embedded?.events ?? [];
+    const items: PlanItem[] = events
+        .map((ev: any) => {
+            const venue = ev?._embedded?.venues?.[0]
+            const city = venue?.city?.name;
+            const state = venue?.state?.stateCode ?? venue?.state?.name;
+            const address =
+                venue?.address?.line1 && city
+                    ? `${venue.address.line1}, ${city}${state ? ", " + state : ""}`
+                    : city || undefined;
+            const whenISO = ev?.dates?.start?.dateTime || ev?.dates?.start?.localDate;
+            const vlat = parseFloat(venue?.location?.latitude ?? venue?.latitude);
+            const vlon = parseFloat(venue?.location?.longitude ?? venue?.longitude);
+            if (!Number.isFinite(vlat) || !Number.isFinite(vlon)) return null;
+            return {
+                title: ev?.name ?? "Event",
+                lat: vlat,
+                lon: vlon,
+                url: ev?.url,
+                source: "event" as const,
+                venue: venue?.name,
+                address,
+                whenISO,
+            } as PlanItem;
+        })
+        .filter(Boolean) as PlanItem[];
+
+    return items;
+}
+
+
+
+
 /** ---------------------
  *   payload validation
  * ----------------------
@@ -297,36 +389,44 @@ export async function POST(req: NextRequest) {
         } = validate(body);
         if (!valid) return fail(`Invalid payload: ${errors.join(", ")}`, 422);
 
-        const cacheKey = JSON.stringify({ date, budget, interests, location, timeframe, rangeStart, rangeEnd, useOpenNow });
+        const cacheKey = JSON.stringify({ date, budget, interests, location, timeframe, rangeStart, rangeEnd, useOpenNow, EB_ENABLED });
         const now = Date.now();
         const hit = cache.get(cacheKey);
         if (hit && hit.expires > now) return ok(hit.data);
 
         const center = await geocode(location);
         if (!center) {
-            const resp: PlanResponse = {} as any;
+            const resp: PlanResponse = {
+                date, budget, interests, location,
+                center: { lat: 0, lon: 0 },
+                items: [],
+            };
             cache.set(cacheKey, { expires: now + CACHE_TTL_MS, data: resp });
             return ok(resp);
         }
 
-        // build time window for Eventbrite
+        // build time window for events providers
         const { start, end } = buildWindow(date, timeframe, rangeStart, rangeEnd);
 
-        const [yelpRes, ebRes] = await Promise.allSettled([
+        // Providers
+        const promises: Promise<PlanItem[]>[] = [
             fetchYelp(center, interests, budget, useOpenNow),
-            fetchEventbrite(center, start, end, interests),
-        ]);
+            EB_ENABLED ? fetchEventbrite(center, start, end, interests) : Promise.resolve([]),
+            fetchTicketmaster(center, start, end, interests),
+        ];
 
+        const settled = await Promise.allSettled(promises);
+
+        const yelpRes = settled[0].status === "fulfilled" ? settled[0].value : [];
+        const ebRes = settled[1].status === "fulfilled" ? settled[1].value : [];
+        const tmRes = settled[2].status === "fulfilled" ? settled[2].value : [];
+
+        // debug
         console.log(
-            "Yelp:", yelpRes.status === "fulfilled" ? yelpRes.value.length : `ERR ${yelpRes.status}`,
-            "Eventbrite:", ebRes.status === "fulfilled" ? ebRes.value.length : `ERR ${ebRes.status}`
+            `[plan] yelp=${yelpRes.length} eventbrite=${ebRes.length} ticketmaster=${tmRes.length} (EB_ENABLED=${EB_ENABLED})`
         );
 
-
-        const items = [
-            ...(yelpRes.status === "fulfilled" ? yelpRes.value : []),
-            ...(ebRes.status === "fulfilled" ? ebRes.value : []),
-        ];
+        const items = [...yelpRes, ...ebRes, ...tmRes];
 
         const final = items.length ? rank(dedupe(items), 12) : fallbackItemsAround(center, 4);
         const [lat, lon] = center;
@@ -336,8 +436,6 @@ export async function POST(req: NextRequest) {
             center: { lat, lon },
             items: final,
         };
-
-        console.log("EB token present?", !!process.env.EVENTBRITE_TOKEN);
 
         cache.set(cacheKey, { expires: now + CACHE_TTL_MS, data: resp });
         return ok(resp);

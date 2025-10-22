@@ -4,7 +4,17 @@ import { useState } from "react";
 import MapView from "./MapView";
 
 // Keep types local to this file for simplicity
-type PlanItem = { title: string; lat: number; lon: number; url?: string; source?: string };
+type PlanItem = {
+  title: string;
+  lat: number;
+  lon: number;
+  url?: string;
+  source?: string;
+  venue?: string;
+  address?: string;
+  whenISO?: string;
+};
+
 type PlanResponse = {
   date: string;
   budget: string;
@@ -13,6 +23,18 @@ type PlanResponse = {
   center: { lat: number; lon: number };
   items: PlanItem[];
 };
+
+// helper to format ISO times if present
+function formatWhen(iso?: string) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  // Localized short “Sat 7:00 PM”
+  return d.toLocaleString(undefined, {
+    weekday: "short",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
 
 export default function UserForm() {
   const [formData, setFormData] = useState({
@@ -54,9 +76,7 @@ export default function UserForm() {
         return;
       }
 
-      setPlanTitles(
-        data.items.map((i) => `${i.title} (${formData.location})`)
-      );
+      setPlanTitles(data.items.map((i) => `${i.title} (${formData.location})`));
       setPoints(data.items);
     } catch (err) {
       console.error(err);
@@ -121,7 +141,7 @@ export default function UserForm() {
         <select
           name="timeframe"
           value={formData.timeframe}
-          onChange={(e) => setFormData(f => ({ ...f, timeframe: e.target.value }))}
+          onChange={(e) => setFormData((f) => ({ ...f, timeframe: e.target.value }))}
           className="border border-gray-300 rounded-lg p-2"
         >
           <option value="day">Selected day only</option>
@@ -137,7 +157,7 @@ export default function UserForm() {
               type="datetime-local"
               name="rangeStart"
               value={formData.rangeStart}
-              onChange={(e) => setFormData(f => ({ ...f, rangeStart: e.target.value }))}
+              onChange={(e) => setFormData((f) => ({ ...f, rangeStart: e.target.value }))}
               className="border border-gray-300 rounded-lg p-2"
               placeholder="Start"
             />
@@ -145,7 +165,7 @@ export default function UserForm() {
               type="datetime-local"
               name="rangeEnd"
               value={formData.rangeEnd}
-              onChange={(e) => setFormData(f => ({ ...f, rangeEnd: e.target.value }))}
+              onChange={(e) => setFormData((f) => ({ ...f, rangeEnd: e.target.value }))}
               className="border border-gray-300 rounded-lg p-2"
               placeholder="End"
             />
@@ -157,7 +177,7 @@ export default function UserForm() {
           <input
             type="checkbox"
             checked={formData.useOpenNow}
-            onChange={(e) => setFormData(f => ({ ...f, useOpenNow: e.target.checked }))}
+            onChange={(e) => setFormData((f) => ({ ...f, useOpenNow: e.target.checked }))}
           />
           Only show places open now (Yelp)
         </label>
@@ -165,10 +185,9 @@ export default function UserForm() {
         <button
           type="submit"
           disabled={loading}
-          className={`py-2 rounded-lg transition text-white ${loading
-            ? "bg-blue-300 cursor-not-allowed"
-            : "bg-blue-500 hover:bg-blue-600"
-            }`}
+          className={`py-2 rounded-lg transition text-white ${
+            loading ? "bg-blue-300 cursor-not-allowed" : "bg-blue-500 hover:bg-blue-600"
+          }`}
         >
           {loading ? "Generating..." : "Generate Plan"}
         </button>
@@ -181,7 +200,7 @@ export default function UserForm() {
             <h3 className="text-lg font-bold mb-2 text-center text-gray-700">
               Your Hidden Day Plan ✨
             </h3>
-            <ul className="list-disc pl-5 text-gray-700 mb-4">
+            <ul className="list-disc pl-5 text-gray-700 mb-4 space-y-2">
               {points && points.length > 0 ? (
                 points.map((p, i) => (
                   <li key={i}>
@@ -202,17 +221,24 @@ export default function UserForm() {
                         {p.source}
                       </span>
                     )}
-                    {" "}({formData.location})
+                    {/* compact preview line (only shows if data is present) */}
+                    {(p.venue || p.whenISO || p.address) && (
+                      <div className="text-sm text-gray-500">
+                        {p.venue ?? ""}
+                        {p.venue && p.whenISO ? " • " : ""}
+                        {formatWhen(p.whenISO)}
+                        {p.address ? ` • ${p.address}` : ""}
+                      </div>
+                    )}
                   </li>
                 ))
               ) : (
                 planTitles.map((item, i) => <li key={i}>{item}</li>)
               )}
             </ul>
-
           </div>
 
-          {/* pass API points to the map; falls back to jitter mode if null */}
+          {/* pass API points to the map falls back to jitter mode if null */}
           <MapView
             location={formData.location}
             plan={planTitles}
