@@ -3,6 +3,9 @@
 import { useState } from "react";
 import MapView from "./MapView";
 
+// Base backend URL (read from .env.local)
+const API_BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "";
+
 // Keep types local to this file for simplicity
 type PlanItem = {
   title: string;
@@ -62,7 +65,7 @@ export default function UserForm() {
     setLoading(true);
 
     try {
-      const res = await fetch("/api/plan", {
+      const res = await fetch(`${API_BASE}/plan`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(formData),
