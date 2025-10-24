@@ -10,7 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # copy and install deps to leverage Docer layer caching
-COPY backend/requirements.txt ./requirements.txt
+COPY requirements.txt ./requirements.txt
+COPY . .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # copy backend code
