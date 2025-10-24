@@ -11,11 +11,10 @@ WORKDIR /app
 
 # copy and install deps to leverage Docer layer caching
 COPY requirements.txt ./requirements.txt
-COPY . .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # copy backend code
-COPY backend/ ./
+COPY backend . ./
 
 # Env defaults (render will inject real ones, safe fallbacks here)
 ENV APP_HOST=0.0.0.0
