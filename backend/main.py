@@ -17,16 +17,23 @@ from providers.eventbrite import fetch_eventbrite
 load_dotenv()
 
 app = FastAPI(title="Hidden Day Planner API", version ="0.4.0")
+# CORS origins
+FRONTEND_LOCAL = "http://localhost:3000"
+FRONTEND_PROD = os.getenv("FRONTEND_PROD", "https://your-frontend-domain.example")
 
-# CORS - allow Next.js dev server
+origins = [FRONTEND_LOCAL, FRONTEND_PROD]
+
+RENDER_BACKEND = os.getenv("RENDER_BACKEND_URL")
+if RENDER_BACKEND:
+    origins.append(RENDER_BACKEND)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # logging
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("hidden-day")
