@@ -19,21 +19,20 @@ load_dotenv()
 app = FastAPI(title="Hidden Day Planner API", version ="0.4.0")
 # CORS origins
 FRONTEND_LOCAL = "http://localhost:3000"
-FRONTEND_PROD = os.getenv("FRONTEND_PROD", "https://your-frontend-domain.example")
+FRONTEND_PROD = os.getenv("FRONTEND_PROD", "")  # set later to your Vercel URL
 
-origins = [FRONTEND_LOCAL, FRONTEND_PROD]
-
-RENDER_BACKEND = os.getenv("RENDER_BACKEND_URL")
-if RENDER_BACKEND:
-    origins.append(RENDER_BACKEND)
+origins = [FRONTEND_LOCAL]
+if FRONTEND_PROD:
+    origins.append(FRONTEND_PROD)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=origins,        # ✅ not [origins]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # logging
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("hidden-day")
@@ -95,7 +94,7 @@ async def create_plan(req: PlanRequest):
         budget=req.budget,
         interests=req.interests,
         location=req.location,
-        center={"lat": center[0], "lon": center[1]},
+        center={"lat": center[0], "lng": center[1]},
         items=items
     ).model_dump()
     

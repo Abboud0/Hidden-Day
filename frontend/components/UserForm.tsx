@@ -3,14 +3,15 @@
 import { useState } from "react";
 import MapView from "./MapView";
 
-// Base backend URL (read from .env.local)
+// Reads from .env.local
 const API_BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "";
 
-// Keep types local to this file for simplicity
+// Types
 type PlanItem = {
   title: string;
   lat: number;
-  lon: number;
+  lon?: number;
+  lng?: number;
   url?: string;
   source?: string;
   venue?: string;
@@ -23,15 +24,27 @@ type PlanResponse = {
   budget: string;
   interests: string;
   location: string;
-  center: { lat: number; lon: number };
+  center: { lat: number; lon?: number; lng?: number }; // <- tolerate either
   items: PlanItem[];
 };
+
+type MapPoint = { lat: number; lon: number; title: string };
+function toMapPoints(items: PlanItem[] | null): MapPoint[] | undefined {
+  if (!items) return undefined;
+  return items
+    .map((i) => {
+      const lon = (i as any).lng ?? i.lon; // accept either lng or lon
+      if (typeof i.lat !== "number" || typeof lon !== "number") return null;
+      const title = i.title ?? "Place";
+      return { lat: i.lat, lon, title };
+    })
+    .filter((p): p is MapPoint => !!p);
+}
 
 // helper to format ISO times if present
 function formatWhen(iso?: string) {
   if (!iso) return "";
   const d = new Date(iso);
-  // Localized short “Sat 7:00 PM”
   return d.toLocaleString(undefined, {
     weekday: "short",
     hour: "numeric",
@@ -62,25 +75,50 @@ export default function UserForm() {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (!API_BASE) {
+      alert("Set NEXT_PUBLIC_BACKEND_URL in .env.local to your Render URL.");
+      return;
+    }
     setLoading(true);
 
     try {
+      // Backend expects some fields as strings (budget, interests, location)
+      const payload = {
+        ...formData,
+        budget: String(formData.budget ?? ""),
+        interests: String(formData.interests ?? ""),
+        location: String(formData.location ?? ""),
+      };
+
       const res = await fetch(`${API_BASE}/plan`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(formData),
+        body: JSON.stringify(payload),
       });
 
       const data: PlanResponse = await res.json();
 
       if (!res.ok) {
-        alert((data as any)?.error ?? "Failed to generate plan");
+        const msg =
+          (data as any)?.detail ??
+          (data as any)?.error ??
+          "Failed to generate plan";
+        alert(typeof msg === "string" ? msg : JSON.stringify(msg));
         setLoading(false);
         return;
       }
 
-      setPlanTitles(data.items.map((i) => `${i.title} (${formData.location})`));
-      setPoints(data.items);
+      // Normalize lng/lon so MapView is happy regardless of backend field
+      const normalizedItems: PlanItem[] = (data.items || []).map((i) => ({
+        ...i,
+        lng: i.lng ?? i.lon, // ensure lng is present for leaflet
+        lon: i.lon ?? i.lng, // keep lon too for compatibility
+      }));
+
+      setPlanTitles(
+        normalizedItems.map((i) => `${i.title} (${formData.location})`)
+      );
+      setPoints(normalizedItems);
     } catch (err) {
       console.error(err);
       alert("Network error while generating the plan.");
@@ -144,7 +182,9 @@ export default function UserForm() {
         <select
           name="timeframe"
           value={formData.timeframe}
-          onChange={(e) => setFormData((f) => ({ ...f, timeframe: e.target.value }))}
+          onChange={(e) =>
+            setFormData((f) => ({ ...f, timeframe: e.target.value }))
+          }
           className="border border-gray-300 rounded-lg p-2"
         >
           <option value="day">Selected day only</option>
@@ -153,14 +193,16 @@ export default function UserForm() {
           <option value="custom">Custom range</option>
         </select>
 
-        {/* custom range (shown only if timeframe=custom) */}
+        {/* custom range */}
         {formData.timeframe === "custom" && (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
             <input
               type="datetime-local"
               name="rangeStart"
               value={formData.rangeStart}
-              onChange={(e) => setFormData((f) => ({ ...f, rangeStart: e.target.value }))}
+              onChange={(e) =>
+                setFormData((f) => ({ ...f, rangeStart: e.target.value }))
+              }
               className="border border-gray-300 rounded-lg p-2"
               placeholder="Start"
             />
@@ -168,7 +210,9 @@ export default function UserForm() {
               type="datetime-local"
               name="rangeEnd"
               value={formData.rangeEnd}
-              onChange={(e) => setFormData((f) => ({ ...f, rangeEnd: e.target.value }))}
+              onChange={(e) =>
+                setFormData((f) => ({ ...f, rangeEnd: e.target.value }))
+              }
               className="border border-gray-300 rounded-lg p-2"
               placeholder="End"
             />
@@ -180,7 +224,9 @@ export default function UserForm() {
           <input
             type="checkbox"
             checked={formData.useOpenNow}
-            onChange={(e) => setFormData((f) => ({ ...f, useOpenNow: e.target.checked }))}
+            onChange={(e) =>
+              setFormData((f) => ({ ...f, useOpenNow: e.target.checked }))
+            }
           />
           Only show places open now (Yelp)
         </label>
@@ -188,9 +234,10 @@ export default function UserForm() {
         <button
           type="submit"
           disabled={loading}
-          className={`py-2 rounded-lg transition text-white ${
-            loading ? "bg-blue-300 cursor-not-allowed" : "bg-blue-500 hover:bg-blue-600"
-          }`}
+          className={`py-2 rounded-lg transition text-white ${loading
+            ? "bg-blue-300 cursor-not-allowed"
+            : "bg-blue-500 hover:bg-blue-600"
+            }`}
         >
           {loading ? "Generating..." : "Generate Plan"}
         </button>
@@ -224,7 +271,6 @@ export default function UserForm() {
                         {p.source}
                       </span>
                     )}
-                    {/* compact preview line (only shows if data is present) */}
                     {(p.venue || p.whenISO || p.address) && (
                       <div className="text-sm text-gray-500">
                         {p.venue ?? ""}
@@ -241,12 +287,12 @@ export default function UserForm() {
             </ul>
           </div>
 
-          {/* pass API points to the map falls back to jitter mode if null */}
           <MapView
             location={formData.location}
             plan={planTitles}
-            points={points ?? undefined}
+            points={toMapPoints(points)}
           />
+
         </>
       )}
     </div>
