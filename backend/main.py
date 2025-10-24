@@ -4,9 +4,11 @@
 import os
 import json
 import logging
+import asyncio
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from models import PlanRequest, PlanResponse, PlanItem
 from utils import TTLCache, build_window, dedupe, rank
 from providers.geo import geocode
@@ -19,7 +21,7 @@ load_dotenv()
 app = FastAPI(title="Hidden Day Planner API", version ="0.4.0")
 # CORS origins
 FRONTEND_LOCAL = "http://localhost:3000"
-FRONTEND_PROD = os.getenv("FRONTEND_PROD", "")  # set later to your Vercel URL
+FRONTEND_PROD = os.getenv("FRONTEND_PROD", "")
 
 origins = [FRONTEND_LOCAL]
 if FRONTEND_PROD:
@@ -27,7 +29,7 @@ if FRONTEND_PROD:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,        # ✅ not [origins]
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,8 +45,41 @@ EVENTBRITE_TOKEN = os.getenv("EVENTBRITE_TOKEN", "")
 EB_ENABLED = (os.getenv("EB_ENABLE", "0").lower() not in ["0", "false", "no"])
 TICKETMASTER_API_KEY = os.getenv("TICKETMASTER_API_KEY", "")
 
+# provider timeout (seconds)
+PROVIDER_TIMEOUT_S = int(os.getenv("PROVIDER_TIMEOUT_S", "12"))
+
 # per process cache (10 mins)
 cache = TTLCache(ttl_seconds=600)
+
+# global JSON error handling
+# - HTTPException -> { "error": <detail> }
+# - any other exception -> { "error": "Server error" }
+@app.exception_handler(HTTPException)
+async def http_error_handler(request: Request, exc: HTTPException):
+    # concise log. frontend expects JSON only
+    log.warning("HTTP %s: %s", exc.status_code, exc.detail)
+    return JSONResponse(status_code=exc.status_code, content={"error": str(exc.detail)})
+
+@app.exception_handler(Exception)
+async def unhandled_error_handler(request: Request, exc: Exception):
+    # log stack once. do not leak details to client
+    log.exception("Unhandled exception")
+    return JSONResponse(status_code=500, content={"error": "Server error"})
+
+# timeout wrapper for providers
+# returns (items, errstr) and never raises
+async def run_with_timeout(coro, seconds: int, label: str):
+    try:
+        items = await asyncio.wait_for(coro, timeout=seconds)
+        return items, None
+    except asyncio.TimeoutError:
+        msg = f"{label} timed out after {seconds}s"
+        log.warning(msg)
+        return [], msg
+    except Exception as e:
+        msg = f"{label} error: {e}"
+        log.warning(msg)
+        return [], msg
 
 @app.post("/plan", response_model=PlanResponse)
 async def create_plan(req: PlanRequest):
@@ -61,32 +96,53 @@ async def create_plan(req: PlanRequest):
     # geocode
     center = await geocode(req.location)
     if not center:
+        # keep 200 to avoid frontend "HTML" parse issues, but be explicit
         raise HTTPException(status_code=200, detail="No geocode results")
     
     start, end = build_window(req.date, req.timeframe, req.rangeStart, req.rangeEnd)
     
     # call providers
-    import asyncio
-    tasks = [
-        fetch_yelp(center, req.interests, req.budget, req.useOpenNow, YELP_API_KEY),
-        fetch_ticketmaster(center, start, end, req.interests, TICKETMASTER_API_KEY),
-    ]
-    if EB_ENABLED:
-        tasks.append(fetch_eventbrite(center, start, end, req.interests, EVENTBRITE_TOKEN))
+    tasks = []
+    labels = []
+
+    if YELP_API_KEY:
+        tasks.append(run_with_timeout(
+            fetch_yelp(center, req.interests, req.budget, req.useOpenNow, YELP_API_KEY),
+            PROVIDER_TIMEOUT_S, "yelp"))
+        labels.append("yelp")
+
+    if TICKETMASTER_API_KEY:
+        tasks.append(run_with_timeout(
+            fetch_ticketmaster(center, start, end, req.interests, TICKETMASTER_API_KEY),
+            PROVIDER_TIMEOUT_S, "ticketmaster"))
+        labels.append("ticketmaster")
+
+    if EB_ENABLED and EVENTBRITE_TOKEN:
+        tasks.append(run_with_timeout(
+            fetch_eventbrite(center, start, end, req.interests, EVENTBRITE_TOKEN),
+            PROVIDER_TIMEOUT_S, "eventbrite"))
+        labels.append("eventbrite")
         
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    if not tasks:
+        # nothing configured; hard error (JSON via handler)
+        raise HTTPException(status_code=500, detail="No providers configured")
     
-    # extract lists and swallow errors gracefully
-    yelp_items, tm_items, eb_items = [], [], []
-    idx = 0
-    if len(results) >= 1 and not isinstance(results[0], Exception): yelp_items = results[0]
-    if len(results) >= 2 and not isinstance(results[1], Exception): tm_items = results[1]
-    if EB_ENABLED and len(results) >= 3 and not isinstance(results[2], Exception): eb_items = results[2]
+    results = await asyncio.gather(*tasks)
+
+    # extract lists and collect non-fatal errors (partial results allowed)
+    items_all = []
+    errors = []
+    for (items, err), label in zip(results, labels):
+        if items:
+            items_all.extend(items)
+        if err:
+            errors.append(err)
+    log.info("providers: %s", ", ".join(f"{lbl}={sum(1 for (its,_) in [r] for r in [])}" for lbl in labels))  # (kept simple)
+    if errors:
+        for e in errors:
+            log.warning("provider issue: %s", e)
     
-    log.info("providers: yelp=%s ticketmaster=%s eventbrite=%s(EB=%s)",
-            len(yelp_items), len(tm_items), len(eb_items), EB_ENABLED)
-    
-    items = dedupe([*yelp_items, *tm_items, *eb_items])
+    items = dedupe(items_all)
     items = rank(items, limit=12)
     
     resp = PlanResponse(
@@ -99,10 +155,12 @@ async def create_plan(req: PlanRequest):
     ).model_dump()
     
     cache.set(cache_key, resp)
+    # if every provider failed and we have zero items, surface a JSON error
+    if not items:
+        # still use 500 so frontend can show friendly message
+        raise HTTPException(status_code=500, detail=errors[0] if errors else "No results")
     return resp
 
 @app.get("/health")
 def health():
     return {"ok": True}
-
-    
