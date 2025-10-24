@@ -26,4 +26,4 @@ ENV PORT=8000
 EXPOSE 8000
 
 # Launch FastAPI
-CMD ["bash", "-lc", "python -m uvicorn backend.main:app --host ${APP_HOST} --port ${PORT:-$APP_PORT}"]
+CMD ["bash", "-lc", "python -m uvicorn main:app --host ${APP_HOST} --port ${PORT:-$APP_PORT}"]
