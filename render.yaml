@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: hidden-day-backend
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
+    dockerContext: ./backend
+    dockerfilePath: ./backend/Dockerfile
+    # keep secrets in the dashboard (sync: false)
+    envVars:
+      - key: YELP_API_KEY
+        sync: false
+      - key: TICKETMASTER_API_KEY
+        sync: false
+      - key: EVENTBRITE_TOKEN
+        sync: false
+      - key: EB_ENABLE
+        value: "0"
+      - key: APP_HOST
+        value: "0.0.0.0"
+      - key: APP_PORT
+        value: "8000"
