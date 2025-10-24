@@ -15,23 +15,30 @@ type Point = { lat: number; lon: number; title: string };
 interface MapViewProps {
   location: string;
   plan: string[];
-  /** Optional: points from your /api/plan (uses these coords if provided) */
   points?: Point[];
 }
 
 export default function MapView({ location, plan, points }: MapViewProps) {
   const [center, setCenter] = useState<[number, number] | null>(null);
   const [markers, setMarkers] = useState<[number, number][]>([]);
+  const [defaultIcon, setDefaultIcon] = useState<import("leaflet").Icon | null>(null);
 
-  // Create Leaflet icon on the client only
-  const defaultIcon = useMemo(() => {
-    if (typeof window === "undefined") return undefined as any;
-    const L = require("leaflet"); // lazy require avoids SSR issues
-    return L.icon({
-      iconUrl: "https://unpkg.com/leaflet@1.7.1/dist/images/marker-icon.png",
-      shadowUrl: "https://unpkg.com/leaflet@1.7.1/dist/images/marker-shadow.png",
-      iconAnchor: [12, 41],
-    });
+  // Create Leaflet icon on the client only (no require, no any)
+  useEffect(() => {
+    let alive = true;
+    if (typeof window === "undefined") return;
+    (async () => {
+      const L = await import("leaflet");
+      const icon = L.icon({
+        iconUrl: "https://unpkg.com/leaflet@1.7.1/dist/images/marker-icon.png",
+        shadowUrl: "https://unpkg.com/leaflet@1.7.1/dist/images/marker-shadow.png",
+        iconAnchor: [12, 41],
+      });
+      if (alive) setDefaultIcon(icon);
+    })();
+    return () => {
+      alive = false;
+    };
   }, []);
 
   // Get base lat/lon for the entered location, then choose markers
@@ -42,7 +49,7 @@ export default function MapView({ location, plan, points }: MapViewProps) {
       `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(location)}`,
       { headers: { "User-Agent": "HiddenDay/0.1 (demo)" } }
     )
-      .then(r => r.json())
+      .then(r => r.json() as Promise<Array<{ lat: string; lon: string }>>)
       .then(data => {
         if (!data?.length) return;
         const base: [number, number] = [parseFloat(data[0].lat), parseFloat(data[0].lon)];
@@ -59,6 +66,9 @@ export default function MapView({ location, plan, points }: MapViewProps) {
           });
           setMarkers(jittered);
         }
+      })
+      .catch(() => {
+        /* ignore fetch errors for demo */
       });
   }, [location, plan, points]);
 

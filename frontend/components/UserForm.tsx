@@ -3,7 +3,7 @@
 import { useState } from "react";
 import MapView from "./MapView";
 
-// Reads from .env.local
+// Base backend URL (read from .env.local)
 const API_BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "";
 
 // Types
@@ -24,32 +24,42 @@ type PlanResponse = {
   budget: string;
   interests: string;
   location: string;
-  center: { lat: number; lon?: number; lng?: number }; // <- tolerate either
+  center: { lat: number; lon?: number; lng?: number };
   items: PlanItem[];
 };
 
+// MapView wants {lat, lon, title}
 type MapPoint = { lat: number; lon: number; title: string };
 function toMapPoints(items: PlanItem[] | null): MapPoint[] | undefined {
   if (!items) return undefined;
   return items
     .map((i) => {
-      const lon = (i as any).lng ?? i.lon; // accept either lng or lon
-      if (typeof i.lat !== "number" || typeof lon !== "number") return null;
-      const title = i.title ?? "Place";
-      return { lat: i.lat, lon, title };
+      const lonVal = typeof i.lng === "number" ? i.lng : i.lon;
+      if (typeof i.lat !== "number" || typeof lonVal !== "number") return null;
+      return { lat: i.lat, lon: lonVal, title: i.title ?? "Place" };
     })
     .filter((p): p is MapPoint => !!p);
+}
+
+// Extract a readable error message without using any
+function getErrorMessage(x: unknown): string {
+  if (!x) return "Unknown error";
+  if (typeof x === "string") return x;
+  if (typeof x === "object") {
+    const o = x as Record<string, unknown>;
+    if (typeof o.error === "string") return o.error;
+    if (typeof o.message === "string") return o.message;
+    if (Array.isArray(o.detail)) return JSON.stringify(o.detail);
+    if (typeof o.detail === "string") return o.detail;
+  }
+  return "Request failed";
 }
 
 // helper to format ISO times if present
 function formatWhen(iso?: string) {
   if (!iso) return "";
   const d = new Date(iso);
-  return d.toLocaleString(undefined, {
-    weekday: "short",
-    hour: "numeric",
-    minute: "2-digit",
-  });
+  return d.toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" });
 }
 
 export default function UserForm() {
@@ -82,7 +92,6 @@ export default function UserForm() {
     setLoading(true);
 
     try {
-      // Backend expects some fields as strings (budget, interests, location)
       const payload = {
         ...formData,
         budget: String(formData.budget ?? ""),
@@ -96,32 +105,21 @@ export default function UserForm() {
         body: JSON.stringify(payload),
       });
 
-      const data: PlanResponse = await res.json();
+      const data: unknown = await res.json();
 
       if (!res.ok) {
-        const msg =
-          (data as any)?.detail ??
-          (data as any)?.error ??
-          "Failed to generate plan";
-        alert(typeof msg === "string" ? msg : JSON.stringify(msg));
+        alert(getErrorMessage(data));
         setLoading(false);
         return;
       }
 
-      // Normalize lng/lon so MapView is happy regardless of backend field
-      const normalizedItems: PlanItem[] = (data.items || []).map((i) => ({
-        ...i,
-        lng: i.lng ?? i.lon, // ensure lng is present for leaflet
-        lon: i.lon ?? i.lng, // keep lon too for compatibility
-      }));
+      const plan = data as PlanResponse;
+      const normalized = toMapPoints(plan.items || []);
 
-      setPlanTitles(
-        normalizedItems.map((i) => `${i.title} (${formData.location})`)
-      );
-      setPoints(normalizedItems);
+      setPlanTitles((plan.items || []).map((i) => `${i.title} (${formData.location})`));
+      setPoints(plan.items || []);
     } catch (err) {
-      console.error(err);
-      alert("Network error while generating the plan.");
+      alert(getErrorMessage(err));
     } finally {
       setLoading(false);
     }
@@ -129,161 +127,78 @@ export default function UserForm() {
 
   return (
     <div className="w-full max-w-md mx-auto mt-8">
-      <form
-        onSubmit={handleSubmit}
-        className="flex flex-col gap-4 bg-white p-6 rounded-2xl shadow-lg"
-      >
-        <h2 className="text-xl font-semibold text-gray-800 text-center">
-          Plan Your Hidden Day
-        </h2>
+      <form onSubmit={handleSubmit} className="flex flex-col gap-4 bg-white p-6 rounded-2xl shadow-lg">
+        <h2 className="text-xl font-semibold text-gray-800 text-center">Plan Your Hidden Day</h2>
 
-        <input
-          type="date"
-          name="date"
-          value={formData.date}
-          onChange={handleChange}
-          className="border border-gray-300 rounded-lg p-2"
-          required
-        />
+        <input type="date" name="date" value={formData.date} onChange={handleChange}
+               className="border border-gray-300 rounded-lg p-2" required />
 
-        <input
-          type="number"
-          name="budget"
-          value={formData.budget}
-          onChange={handleChange}
-          placeholder="Budget ($)"
-          className="border border-gray-300 rounded-lg p-2"
-          min={0}
-          step="1"
-          required
-        />
+        <input type="number" name="budget" value={formData.budget} onChange={handleChange}
+               placeholder="Budget ($)" className="border border-gray-300 rounded-lg p-2" min={0} step="1" required />
 
-        <input
-          type="text"
-          name="interests"
-          value={formData.interests}
-          onChange={handleChange}
-          placeholder="Interests (e.g., food, nature, art)"
-          className="border border-gray-300 rounded-lg p-2"
-          required
-        />
+        <input type="text" name="interests" value={formData.interests} onChange={handleChange}
+               placeholder="Interests (e.g., food, nature, art)" className="border border-gray-300 rounded-lg p-2" required />
 
-        <input
-          type="text"
-          name="location"
-          value={formData.location}
-          onChange={handleChange}
-          placeholder="Your city or area"
-          className="border border-gray-300 rounded-lg p-2"
-          required
-        />
+        <input type="text" name="location" value={formData.location} onChange={handleChange}
+               placeholder="Your city or area" className="border border-gray-300 rounded-lg p-2" required />
 
-        {/* timeframe select */}
-        <select
-          name="timeframe"
-          value={formData.timeframe}
-          onChange={(e) =>
-            setFormData((f) => ({ ...f, timeframe: e.target.value }))
-          }
-          className="border border-gray-300 rounded-lg p-2"
-        >
+        <select name="timeframe" value={formData.timeframe}
+                onChange={(e) => setFormData((f) => ({ ...f, timeframe: e.target.value }))}
+                className="border border-gray-300 rounded-lg p-2">
           <option value="day">Selected day only</option>
           <option value="weekend">Weekend of selected date</option>
           <option value="week">Week of selected date</option>
           <option value="custom">Custom range</option>
         </select>
 
-        {/* custom range */}
         {formData.timeframe === "custom" && (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-            <input
-              type="datetime-local"
-              name="rangeStart"
-              value={formData.rangeStart}
-              onChange={(e) =>
-                setFormData((f) => ({ ...f, rangeStart: e.target.value }))
-              }
-              className="border border-gray-300 rounded-lg p-2"
-              placeholder="Start"
-            />
-            <input
-              type="datetime-local"
-              name="rangeEnd"
-              value={formData.rangeEnd}
-              onChange={(e) =>
-                setFormData((f) => ({ ...f, rangeEnd: e.target.value }))
-              }
-              className="border border-gray-300 rounded-lg p-2"
-              placeholder="End"
-            />
+            <input type="datetime-local" name="rangeStart" value={formData.rangeStart}
+                   onChange={(e) => setFormData((f) => ({ ...f, rangeStart: e.target.value }))}
+                   className="border border-gray-300 rounded-lg p-2" placeholder="Start" />
+            <input type="datetime-local" name="rangeEnd" value={formData.rangeEnd}
+                   onChange={(e) => setFormData((f) => ({ ...f, rangeEnd: e.target.value }))}
+                   className="border border-gray-300 rounded-lg p-2" placeholder="End" />
           </div>
         )}
 
-        {/* yelp open now toggle */}
         <label className="flex items-center gap-2 text-sm text-gray-700">
-          <input
-            type="checkbox"
-            checked={formData.useOpenNow}
-            onChange={(e) =>
-              setFormData((f) => ({ ...f, useOpenNow: e.target.checked }))
-            }
-          />
+          <input type="checkbox" checked={formData.useOpenNow}
+                 onChange={(e) => setFormData((f) => ({ ...f, useOpenNow: e.target.checked }))} />
           Only show places open now (Yelp)
         </label>
 
-        <button
-          type="submit"
-          disabled={loading}
-          className={`py-2 rounded-lg transition text-white ${loading
-            ? "bg-blue-300 cursor-not-allowed"
-            : "bg-blue-500 hover:bg-blue-600"
-            }`}
-        >
+        <button type="submit" disabled={loading}
+                className={`py-2 rounded-lg transition text-white ${loading ? "bg-blue-300 cursor-not-allowed" : "bg-blue-500 hover:bg-blue-600"}`}>
           {loading ? "Generating..." : "Generate Plan"}
         </button>
       </form>
 
-      {/* results */}
       {planTitles.length > 0 && (
         <>
           <div className="mt-6 bg-white p-4 rounded-xl shadow-md">
-            <h3 className="text-lg font-bold mb-2 text-center text-gray-700">
-              Your Hidden Day Plan ✨
-            </h3>
+            <h3 className="text-lg font-bold mb-2 text-center text-gray-700">Your Hidden Day Plan ✨</h3>
             <ul className="list-disc pl-5 text-gray-700 mb-4 space-y-2">
-              {points && points.length > 0 ? (
-                points.map((p, i) => (
-                  <li key={i}>
-                    {p.url ? (
-                      <a
-                        href={p.url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-blue-600 hover:underline"
-                      >
-                        {p.title}
-                      </a>
-                    ) : (
-                      p.title
-                    )}
-                    {p.source && (
-                      <span className="ml-2 rounded bg-gray-100 px-2 py-0.5 text-xs uppercase">
-                        {p.source}
-                      </span>
-                    )}
-                    {(p.venue || p.whenISO || p.address) && (
-                      <div className="text-sm text-gray-500">
-                        {p.venue ?? ""}
-                        {p.venue && p.whenISO ? " • " : ""}
-                        {formatWhen(p.whenISO)}
-                        {p.address ? ` • ${p.address}` : ""}
-                      </div>
-                    )}
-                  </li>
-                ))
-              ) : (
-                planTitles.map((item, i) => <li key={i}>{item}</li>)
-              )}
+              {(points ?? []).map((p, i) => (
+                <li key={i}>
+                  {p.url ? (
+                    <a href={p.url} target="_blank" rel="noreferrer" className="text-blue-600 hover:underline">
+                      {p.title}
+                    </a>
+                  ) : (
+                    p.title
+                  )}
+                  {p.source && (
+                    <span className="ml-2 rounded bg-gray-100 px-2 py-0.5 text-xs uppercase">{p.source}</span>
+                  )}
+                  {(p.venue || p.whenISO || p.address) && (
+                    <div className="text-sm text-gray-500">
+                      {p.venue ?? ""}{p.venue && p.whenISO ? " • " : ""}{formatWhen(p.whenISO)}
+                      {p.address ? ` • ${p.address}` : ""}
+                    </div>
+                  )}
+                </li>
+              ))}
             </ul>
           </div>
 
@@ -292,7 +207,6 @@ export default function UserForm() {
             plan={planTitles}
             points={toMapPoints(points)}
           />
-
         </>
       )}
     </div>
