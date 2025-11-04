@@ -27,17 +27,22 @@ origins = [FRONTEND_LOCAL]
 if FRONTEND_PROD:
     origins.append(FRONTEND_PROD)
 
+# logging
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("hidden-day")
+log.info("CORS allow_origins=%s", origins)
+
+# include regex for Vercel preview domains (e.g., https://hidden-day-git-...vercel.app)
+VERCEL_REGEX = r"^https://.*vercel\.app$"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=origins,           # exact matches: localhost + production domain
+    allow_origin_regex=VERCEL_REGEX, # regex match: any *.vercel.app preview
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# logging
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("hidden-day")
 
 # config / env
 YELP_API_KEY = os.getenv("YELP_API_KEY", "")
@@ -131,12 +136,14 @@ async def create_plan(req: PlanRequest):
     # extract lists and collect non-fatal errors (partial results allowed)
     items_all = []
     errors = []
+    counts = {}
     for (items, err), label in zip(results, labels):
+        counts[label] = len(items) if items else 0
         if items:
             items_all.extend(items)
         if err:
             errors.append(err)
-    log.info("providers: %s", ", ".join(f"{lbl}={sum(1 for (its,_) in [r] for r in [])}" for lbl in labels))  # (kept simple)
+    log.info("providers counts: %s", " ".join(f"{k}={v}" for k, v in counts.items()))
     if errors:
         for e in errors:
             log.warning("provider issue: %s", e)
