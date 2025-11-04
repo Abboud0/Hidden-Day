@@ -17,6 +17,7 @@ interface MapViewProps {
   plan: string[];
   points?: Point[];
   center?: { lat: number; lon: number };
+  loading?: boolean;
 }
 
 export default function MapView({ location, plan, points, center }: MapViewProps) {
