@@ -3,10 +3,10 @@
 import { useState } from "react";
 import MapView from "./MapView";
 
-// Base backend URL (read from .env.local / Vercel dashboard)
+// Base backend URL (read from .env.local)
 const API_BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "";
 
-// Types
+// --- types ---
 type PlanItem = {
   title: string;
   lat: number;
@@ -30,72 +30,6 @@ type PlanResponse = {
 
 // MapView wants {lat, lon, title}
 type MapPoint = { lat: number; lon: number; title: string };
-
-// retry with backoff
-// - Retries transient HTTP statuses (502/503/504/429) & network errors
-// - Backoff schedule: 0s, 2s, 4s, 6s (4 tries)
-// - Includes an AbortController-based client timeout (default 20s)
-async function fetchWithRetry(
-  input: RequestInfo | URL,
-  init: RequestInit & { timeoutMs?: number } = {}
-): Promise<Response> {
-  const delays = [0, 2000, 4000, 6000];
-
-  const doFetch = async () => {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), init.timeoutMs ?? 20000);
-    try {
-      const res = await fetch(input, { ...init, signal: controller.signal });
-      return res;
-    } finally {
-      clearTimeout(timeout);
-    }
-  };
-
-  let lastError: unknown = null;
-
-  for (let attempt = 0; attempt < delays.length; attempt++) {
-    const waitMs = delays[attempt];
-    if (waitMs > 0) {
-      await new Promise((r) => setTimeout(r, waitMs));
-    }
-
-    try {
-      const res = await doFetch();
-
-      // retry only on clearly transient statuses
-      if ([502, 503, 504, 429].includes(res.status)) {
-        lastError = new Error(`Transient status ${res.status}`);
-      } else {
-        return res;
-      }
-    } catch (err) {
-      lastError = err;
-    }
-  }
-
-  throw lastError ?? new Error("Unknown network error");
-}
-
-// safe JSON parsing
-// - read response as text first then parse
-function safeParseJson<T>(
-  text: string
-): { ok: true; data: T } | { ok: false; message: string } {
-  try {
-    const data = JSON.parse(text) as T;
-    return { ok: true, data };
-  } catch {
-    const sample = text.slice(0, 200).replace(/\s+/g, " ");
-    return {
-      ok: false,
-      message: `Could not parse server response as JSON. Sample: "${sample}"`,
-    };
-  }
-}
-
-
-// Utilities
 function toMapPoints(items: PlanItem[] | null): MapPoint[] | undefined {
   if (!items) return undefined;
   return items
@@ -107,7 +41,16 @@ function toMapPoints(items: PlanItem[] | null): MapPoint[] | undefined {
     .filter((p): p is MapPoint => !!p);
 }
 
-// Extract a readable error message
+// --- normalize center to {lat, lon} regardless of {lng|lon} ---
+type Center = { lat: number; lon?: number; lng?: number };
+function toMapCenter(c?: Center): { lat: number; lon: number } | undefined {
+  if (!c || typeof c.lat !== "number") return undefined;
+  const lonVal = typeof c.lng === "number" ? c.lng : c.lon;
+  if (typeof lonVal !== "number") return undefined;
+  return { lat: c.lat, lon: lonVal };
+}
+
+// Extract a readable error message without using any
 function getErrorMessage(x: unknown): string {
   if (!x) return "Unknown error";
   if (typeof x === "string") return x;
@@ -125,14 +68,9 @@ function getErrorMessage(x: unknown): string {
 function formatWhen(iso?: string) {
   if (!iso) return "";
   const d = new Date(iso);
-  return d.toLocaleString(undefined, {
-    weekday: "short",
-    hour: "numeric",
-    minute: "2-digit",
-  });
+  return d.toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" });
 }
 
-// Component
 export default function UserForm() {
   const [formData, setFormData] = useState({
     date: "",
@@ -148,14 +86,14 @@ export default function UserForm() {
   const [planTitles, setPlanTitles] = useState<string[]>([]);
   const [points, setPoints] = useState<PlanItem[] | null>(null);
   const [loading, setLoading] = useState(false);
+  // backend-provided map center (normalized)
+  const [mapCenter, setMapCenter] = useState<{ lat: number; lon: number } | undefined>(undefined);
 
-  // Form handlers
   function handleChange(e: React.ChangeEvent<HTMLInputElement>) {
     const { name, value } = e.target;
     setFormData((prev) => ({ ...prev, [name]: value }));
   }
 
-  // Submit with retry/backoff + safe JSON parsing
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!API_BASE) {
@@ -172,63 +110,44 @@ export default function UserForm() {
         location: String(formData.location ?? ""),
       };
 
-      const url = `${API_BASE.replace(/\/$/, "")}/plan`;
-
-      const res = await fetchWithRetry(url, {
+      const res = await fetch(`${API_BASE}/plan`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
-        timeoutMs: 20000, // 20s client side timeout
       });
 
-      // Read as text then safe-parse JSON
-      const text = await res.text();
-      const parsed = safeParseJson<PlanResponse>(text);
+      const data: unknown = await res.json();
 
-      // If HTTP status is not OK, prefer JSON error message if present
       if (!res.ok) {
-        const apiMessage =
-          parsed.ok && parsed.data && (parsed.data as unknown as { error?: string })?.error
-            ? (parsed.data as unknown as { error: string }).error
-            : `Request failed with ${res.status}`;
-        throw new Error(apiMessage);
+        alert(getErrorMessage(data));
+        setLoading(false);
+        return;
       }
 
-      // If JSON failed to parse, surface friendly parsing error
-      if (!parsed.ok) {
-        throw new Error(parsed.message);
-      }
+      const plan = data as PlanResponse;
 
-      if (!Array.isArray(parsed.data.items)) {
-        throw new Error("Unexpected response shape: missing items[]");
-      }
-
-      // Update UI
-      const plan = parsed.data;
+      // titles + items
       setPlanTitles((plan.items || []).map((i) => `${i.title} (${formData.location})`));
       setPoints(plan.items || []);
+
+      // store backend center (fallback to first point)
+      const c = toMapCenter(plan.center);
+      const fallback =
+        plan.items && plan.items.length > 0
+          ? { lat: plan.items[0].lat, lon: plan.items[0].lng ?? plan.items[0].lon ?? 0 }
+          : undefined;
+      setMapCenter(c ?? fallback);
     } catch (err) {
-      const raw = getErrorMessage(err);
-      const friendly =
-        /502|503|504|429|network|fetch|abort|timeout|Failed to fetch/i.test(raw)
-          ? "Waking server… We tried multiple times but it did not respond. Please try again."
-          : raw;
-      alert(friendly);
+      alert(getErrorMessage(err));
     } finally {
       setLoading(false);
     }
   }
 
-  // Render
   return (
     <div className="w-full max-w-md mx-auto mt-8">
-      <form
-        onSubmit={handleSubmit}
-        className="flex flex-col gap-4 bg-white p-6 rounded-2xl shadow-lg"
-      >
-        <h2 className="text-xl font-semibold text-gray-800 text-center">
-          Plan Your Hidden Day
-        </h2>
+      <form onSubmit={handleSubmit} className="flex flex-col gap-4 bg-white p-6 rounded-2xl shadow-lg">
+        <h2 className="text-xl font-semibold text-gray-800 text-center">Plan Your Hidden Day</h2>
 
         <input
           type="date"
@@ -274,9 +193,7 @@ export default function UserForm() {
         <select
           name="timeframe"
           value={formData.timeframe}
-          onChange={(e) =>
-            setFormData((f) => ({ ...f, timeframe: e.target.value }))
-          }
+          onChange={(e) => setFormData((f) => ({ ...f, timeframe: e.target.value }))}
           className="border border-gray-300 rounded-lg p-2"
         >
           <option value="day">Selected day only</option>
@@ -291,9 +208,7 @@ export default function UserForm() {
               type="datetime-local"
               name="rangeStart"
               value={formData.rangeStart}
-              onChange={(e) =>
-                setFormData((f) => ({ ...f, rangeStart: e.target.value }))
-              }
+              onChange={(e) => setFormData((f) => ({ ...f, rangeStart: e.target.value }))}
               className="border border-gray-300 rounded-lg p-2"
               placeholder="Start"
             />
@@ -301,9 +216,7 @@ export default function UserForm() {
               type="datetime-local"
               name="rangeEnd"
               value={formData.rangeEnd}
-              onChange={(e) =>
-                setFormData((f) => ({ ...f, rangeEnd: e.target.value }))
-              }
+              onChange={(e) => setFormData((f) => ({ ...f, rangeEnd: e.target.value }))}
               className="border border-gray-300 rounded-lg p-2"
               placeholder="End"
             />
@@ -314,9 +227,7 @@ export default function UserForm() {
           <input
             type="checkbox"
             checked={formData.useOpenNow}
-            onChange={(e) =>
-              setFormData((f) => ({ ...f, useOpenNow: e.target.checked }))
-            }
+            onChange={(e) => setFormData((f) => ({ ...f, useOpenNow: e.target.checked }))}
           />
           Only show places open now (Yelp)
         </label>
@@ -371,7 +282,13 @@ export default function UserForm() {
             </ul>
           </div>
 
-          <MapView location={formData.location} plan={planTitles} points={toMapPoints(points)} />
+          {/* Pass backend-provided center to MapView */}
+          <MapView
+            location={formData.location}
+            plan={planTitles}
+            points={toMapPoints(points)}
+            center={mapCenter}
+          />
         </>
       )}
     </div>
