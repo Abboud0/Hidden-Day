@@ -47,6 +47,7 @@ TICKETMASTER_API_KEY = os.getenv("TICKETMASTER_API_KEY", "")
 
 # provider timeout (seconds)
 PROVIDER_TIMEOUT_S = int(os.getenv("PROVIDER_TIMEOUT_S", "12"))
+GEOCODE_TIMEOUT_S = int(os.getenv("GEOCODE_TIMEOUT_S", "10"))  # default 10s
 
 # per process cache (10 mins)
 cache = TTLCache(ttl_seconds=600)
@@ -92,41 +93,39 @@ async def create_plan(req: PlanRequest):
     hit = cache.get(cache_key)
     if hit:
         return PlanResponse(**hit)
-    
-    # geocode
-    center = await geocode(req.location)
-    if not center:
-        # keep 200 to avoid frontend "HTML" parse issues, but be explicit
-        raise HTTPException(status_code=200, detail="No geocode results")
-    
+
+    # ---- geocode with timeout (FIX) ----
+    center, geo_err = await run_with_timeout(
+        geocode(req.location), GEOCODE_TIMEOUT_S, "geocode"
+    )
+    if geo_err or not center:
+        # real client error so frontend shows a friendly message
+        raise HTTPException(status_code=400, detail="Geocoding failed or timed out")
+
     start, end = build_window(req.date, req.timeframe, req.rangeStart, req.rangeEnd)
-    
-    # call providers
+
+    # call providers (unchanged except we already wrap with timeouts)
     tasks = []
     labels = []
-
     if YELP_API_KEY:
         tasks.append(run_with_timeout(
             fetch_yelp(center, req.interests, req.budget, req.useOpenNow, YELP_API_KEY),
             PROVIDER_TIMEOUT_S, "yelp"))
         labels.append("yelp")
-
     if TICKETMASTER_API_KEY:
         tasks.append(run_with_timeout(
             fetch_ticketmaster(center, start, end, req.interests, TICKETMASTER_API_KEY),
             PROVIDER_TIMEOUT_S, "ticketmaster"))
         labels.append("ticketmaster")
-
     if EB_ENABLED and EVENTBRITE_TOKEN:
         tasks.append(run_with_timeout(
             fetch_eventbrite(center, start, end, req.interests, EVENTBRITE_TOKEN),
             PROVIDER_TIMEOUT_S, "eventbrite"))
         labels.append("eventbrite")
-        
+
     if not tasks:
-        # nothing configured; hard error (JSON via handler)
         raise HTTPException(status_code=500, detail="No providers configured")
-    
+
     results = await asyncio.gather(*tasks)
 
     # extract lists and collect non-fatal errors (partial results allowed)
