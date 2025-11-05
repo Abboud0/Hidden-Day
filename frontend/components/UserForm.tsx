@@ -1,11 +1,10 @@
 "use client";
 
 import { useFavorites, makeFavKey } from "./hooks/useFavorites";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import MapView from "./MapView";
 import { LineSkeleton, BlockSkeleton } from "./Skeleton";
 
-// Base backend URL (read from .env.local)
 const API_BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "";
 
 // --- types ---
@@ -131,17 +130,75 @@ function favKeyFromItem(p: PlanItem): string {
   return makeFavKey(provider, idLike);
 }
 
+/* SHAREABLE LINKS */
+
+// Query param keys (kept lowercase for clean URLs)
+const Q = {
+  date: "date",
+  budget: "budget",
+  interests: "interests",
+  location: "location",
+  timeframe: "timeframe",
+  openNow: "openNow",
+  rangeStart: "rangeStart",
+  rangeEnd: "rangeEnd",
+  autoplay: "autoplay", // "1" to auto-submit on load
+} as const;
+
+type FormState = {
+  date: string;
+  budget: string;
+  interests: string;
+  location: string;
+  timeframe: "day" | "weekend" | "week" | "custom";
+  useOpenNow: boolean;
+  rangeStart: string;
+  rangeEnd: string;
+};
+
+function formToParams(f: FormState): URLSearchParams {
+  const p = new URLSearchParams();
+  if (f.date) p.set(Q.date, f.date);
+  if (f.budget) p.set(Q.budget, f.budget);
+  if (f.interests) p.set(Q.interests, f.interests);
+  if (f.location) p.set(Q.location, f.location);
+  if (f.timeframe) p.set(Q.timeframe, f.timeframe);
+  if (f.useOpenNow) p.set(Q.openNow, "1");
+  if (f.timeframe === "custom") {
+    if (f.rangeStart) p.set(Q.rangeStart, f.rangeStart);
+    if (f.rangeEnd) p.set(Q.rangeEnd, f.rangeEnd);
+  }
+  return p;
+}
+
+function paramsToForm(p: URLSearchParams, defaults: FormState): FormState {
+  const timeframe = (p.get(Q.timeframe) as FormState["timeframe"]) || defaults.timeframe;
+  const useOpenNow = p.get(Q.openNow) === "1";
+  return {
+    date: p.get(Q.date) || defaults.date,
+    budget: p.get(Q.budget) || defaults.budget,
+    interests: p.get(Q.interests) || defaults.interests,
+    location: p.get(Q.location) || defaults.location,
+    timeframe,
+    useOpenNow,
+    rangeStart: timeframe === "custom" ? p.get(Q.rangeStart) || "" : "",
+    rangeEnd: timeframe === "custom" ? p.get(Q.rangeEnd) || "" : "",
+  };
+}
+
 export default function UserForm() {
-  const [formData, setFormData] = useState({
+  const defaultForm: FormState = {
     date: "",
     budget: "",
     interests: "",
     location: "",
-    timeframe: "day", // "day" | "weekend" | "week" | "custom"
+    timeframe: "day",
     useOpenNow: false,
     rangeStart: "",
     rangeEnd: "",
-  });
+  };
+
+  const [formData, setFormData] = useState<FormState>(defaultForm);
 
   const [planTitles, setPlanTitles] = useState<string[]>([]);
   const [points, setPoints] = useState<PlanItem[] | null>(null);
@@ -154,13 +211,47 @@ export default function UserForm() {
   const { isFavorite, toggleFavorite } = useFavorites();
   const [showOnlyFavorites, setShowOnlyFavorites] = useState<"ALL" | "FAV">("ALL");
 
+  // Hydrate from URL params on first mount. If autoplay=1, auto-submit after hydration.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const p = new URLSearchParams(window.location.search);
+    const next = paramsToForm(p, defaultForm);
+    setFormData(next);
+
+    const shouldAutoplay = p.get(Q.autoplay) === "1";
+    if (shouldAutoplay && next.date && next.budget && next.interests && next.location) {
+      // Defer to allow state to commit
+      setTimeout(() => {
+        void handleSubmitInternal(next);
+      }, 0);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Keep the URL updated as the user edits (without autoplay)
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const p = formToParams(formData);
+    const url = `${window.location.pathname}?${p.toString()}`;
+    window.history.replaceState(null, "", url);
+  }, [formData]);
+
   function handleChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const { name, value } = e.target;
-    setFormData((prev) => ({ ...prev, [name]: value }));
+    const { name, value, type, checked } = e.target;
+    if (type === "checkbox") {
+      setFormData((prev) => ({ ...prev, [name]: checked }));
+    } else {
+      setFormData((prev) => ({ ...prev, [name]: value }));
+    }
   }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    await handleSubmitInternal(formData);
+  }
+
+  // Core submit logic factored so we can call it from autoplay hydration.
+  async function handleSubmitInternal(current: FormState) {
     if (!API_BASE) {
       setErrorMsg("Set NEXT_PUBLIC_BACKEND_URL in .env.local to your Render URL.");
       return;
@@ -171,10 +262,10 @@ export default function UserForm() {
 
     try {
       const payload = {
-        ...formData,
-        budget: String(formData.budget ?? ""),
-        interests: String(formData.interests ?? ""),
-        location: String(formData.location ?? ""),
+        ...current,
+        budget: String(current.budget ?? ""),
+        interests: String(current.interests ?? ""),
+        location: String(current.location ?? ""),
       };
 
       const res = await fetch(`${API_BASE}/plan`, {
@@ -195,7 +286,7 @@ export default function UserForm() {
       const plan = data as PlanResponse;
 
       // titles + items
-      setPlanTitles((plan.items || []).map((i) => `${i.title} (${formData.location})`));
+      setPlanTitles((plan.items || []).map((i) => `${i.title} (${current.location})`));
       setPoints(plan.items || []);
 
       // map center
@@ -229,12 +320,32 @@ export default function UserForm() {
       <div className="mb-6 text-center">
         <h1 className="text-2xl font-bold text-gray-900">Plan Your Hidden Day</h1>
         <p className="text-gray-600">Discover local gems. We blend places + events, ranked smartly.</p>
-        <button
-          className="mt-2 text-sm text-blue-600 hover:underline"
-          onClick={() => setShowAbout((v) => !v)}
-        >
-          {showAbout ? "Hide details" : "About / How it works"}
-        </button>
+        <div className="mt-2 flex items-center justify-center gap-3">
+          <button
+            className="text-sm text-blue-600 hover:underline"
+            onClick={() => setShowAbout((v) => !v)}
+          >
+            {showAbout ? "Hide details" : "About / How it works"}
+          </button>
+
+          {/* Share this plan - copies current URL with params, add autoplay=1 if results exist */}
+          <button
+            type="button"
+            className="text-sm text-gray-700 hover:underline"
+            onClick={async () => {
+              if (typeof window === "undefined") return;
+              const p = formToParams(formData);
+              // If results, tack on autoplay=1 so recipients instantly see results
+              if (planTitles.length > 0) p.set(Q.autoplay, "1");
+              const shareUrl = `${window.location.origin}${window.location.pathname}?${p.toString()}`;
+              const ok = await copyToClipboard(shareUrl);
+              if (!ok) alert("Copy failed");
+            }}
+          >
+            Share this plan
+          </button>
+        </div>
+
         {showAbout && (
           <div className="mt-3 text-sm bg-white border border-gray-200 rounded-xl p-3 text-left shadow-sm">
             <p className="text-gray-700">
@@ -307,7 +418,14 @@ export default function UserForm() {
         <select
           name="timeframe"
           value={formData.timeframe}
-          onChange={(e) => setFormData((f) => ({ ...f, timeframe: e.target.value }))}
+          onChange={(e) =>
+            setFormData((f) => ({
+              ...f,
+              timeframe: e.target.value as FormState["timeframe"],
+              // Clear custom range fields if leaving "custom"
+              ...(e.target.value !== "custom" ? { rangeStart: "", rangeEnd: "" } : {}),
+            }))
+          }
           className="border border-gray-300 rounded-lg p-2"
         >
           <option value="day">Selected day only</option>
@@ -340,8 +458,9 @@ export default function UserForm() {
         <label className="flex items-center gap-2 text-sm text-gray-700">
           <input
             type="checkbox"
+            name="useOpenNow"
             checked={formData.useOpenNow}
-            onChange={(e) => setFormData((f) => ({ ...f, useOpenNow: e.target.checked }))}
+            onChange={handleChange}
           />
           Only show places open now (Yelp)
         </label>
