@@ -1,14 +1,14 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import "leaflet/dist/leaflet.css";
 
 // Load react-leaflet only on the client (prevents `window is not defined`)
-const MapContainer = dynamic(() => import("react-leaflet").then(m => m.MapContainer), { ssr: false });
-const TileLayer    = dynamic(() => import("react-leaflet").then(m => m.TileLayer),    { ssr: false });
-const Marker       = dynamic(() => import("react-leaflet").then(m => m.Marker),       { ssr: false });
-const Popup        = dynamic(() => import("react-leaflet").then(m => m.Popup),        { ssr: false });
+const MapContainer = dynamic(() => import("react-leaflet").then((m) => m.MapContainer), { ssr: false });
+const TileLayer = dynamic(() => import("react-leaflet").then((m) => m.TileLayer), { ssr: false });
+const Marker = dynamic(() => import("react-leaflet").then((m) => m.Marker), { ssr: false });
+const Popup = dynamic(() => import("react-leaflet").then((m) => m.Popup), { ssr: false });
 
 type Point = { lat: number; lon: number; title: string };
 
@@ -18,6 +18,34 @@ interface MapViewProps {
   points?: Point[];
   center?: { lat: number; lon: number };
   loading?: boolean;
+}
+
+/** Compute Leaflet bounds expression ([[minLat,minLon],[maxLat,maxLon]]) for an array of lat/lon tuples. */
+function computeBounds(coords: [number, number][]): [[number, number], [number, number]] | null {
+  if (!coords.length) return null;
+  let minLat = coords[0][0],
+    maxLat = coords[0][0],
+    minLon = coords[0][1],
+    maxLon = coords[0][1];
+  for (let i = 1; i < coords.length; i++) {
+    const [lat, lon] = coords[i];
+    if (lat < minLat) minLat = lat;
+    if (lat > maxLat) maxLat = lat;
+    if (lon < minLon) minLon = lon;
+    if (lon > maxLon) maxLon = lon;
+  }
+  // If all points are identical, expand a tiny bit to avoid Leaflet zooming too far in.
+  if (minLat === maxLat && minLon === maxLon) {
+    const pad = 0.001; // ~100m
+    return [
+      [minLat - pad, minLon - pad],
+      [maxLat + pad, maxLon + pad],
+    ];
+  }
+  return [
+    [minLat, minLon],
+    [maxLat, maxLon],
+  ];
 }
 
 export default function MapView({ location, plan, points, center }: MapViewProps) {
@@ -34,7 +62,10 @@ export default function MapView({ location, plan, points, center }: MapViewProps
       const icon = L.icon({
         iconUrl: "https://unpkg.com/leaflet@1.7.1/dist/images/marker-icon.png",
         shadowUrl: "https://unpkg.com/leaflet@1.7.1/dist/images/marker-shadow.png",
+        iconSize: [25, 41],
         iconAnchor: [12, 41],
+        popupAnchor: [0, -30],
+        shadowSize: [41, 41],
       });
       if (alive) setDefaultIcon(icon);
     })();
@@ -45,20 +76,21 @@ export default function MapView({ location, plan, points, center }: MapViewProps
 
   // Prefer backend center; fallback to geocoding only if missing
   useEffect(() => {
-    async function updateMap() {
+    let cancelled = false;
+
+    async function updateCenterAndMarkers() {
+      // 1) Center: backend-preferred → fallback geocode
       if (center) {
-        // Use backend-supplied center first
         const base: [number, number] = [center.lat, center.lon];
-        setMapCenter(base);
+        if (!cancelled) setMapCenter(base);
       } else if (location) {
-        // Fallback: geocode location if backend center missing
         try {
           const r = await fetch(
             `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(location)}`,
             { headers: { "User-Agent": "HiddenDay/0.1 (demo)" } }
           );
           const data = (await r.json()) as Array<{ lat: string; lon: string }>;
-          if (data?.length) {
+          if (!cancelled && data?.length) {
             const base: [number, number] = [parseFloat(data[0].lat), parseFloat(data[0].lon)];
             setMapCenter(base);
           }
@@ -67,25 +99,35 @@ export default function MapView({ location, plan, points, center }: MapViewProps
         }
       }
 
-      // Always set markers when points change
+      // 2) Markers
       if (points && points.length) {
-        setMarkers(points.map(p => [p.lat, p.lon] as [number, number]));
+        if (!cancelled) setMarkers(points.map((p) => [p.lat, p.lon]));
       } else if ((center || mapCenter) && plan.length) {
         // fallback jitter if no points
-        const base = center
-          ? [center.lat, center.lon]
-          : mapCenter ?? [0, 0];
+        const base = center ? [center.lat, center.lon] : mapCenter ?? [0, 0];
         const jittered = plan.map(() => {
           const latOffset = (Math.random() - 0.5) * 0.02; // ~±1km
           const lonOffset = (Math.random() - 0.5) * 0.02;
           return [base[0] + latOffset, base[1] + lonOffset] as [number, number];
         });
-        setMarkers(jittered);
+        if (!cancelled) setMarkers(jittered);
+      } else {
+        if (!cancelled) setMarkers([]);
       }
     }
 
-    updateMap();
-  }, [center, location, plan, points]);
+    updateCenterAndMarkers();
+    return () => {
+      cancelled = true;
+    };
+    // include mapCenter so jitter fallback can run once a geocode result arrives
+  }, [center, location, plan, points, mapCenter]);
+
+  // Compute bounds when we have real markers; Leaflet will auto-fit initially.
+  const bounds = useMemo(() => {
+    if (!markers.length) return null;
+    return computeBounds(markers);
+  }, [markers]);
 
   if (!mapCenter)
     return (
@@ -97,14 +139,23 @@ export default function MapView({ location, plan, points, center }: MapViewProps
   return (
     <div className="mt-6 w-full max-w-2xl mx-auto rounded-xl overflow-hidden shadow-lg">
       {typeof window !== "undefined" && (
-        <MapContainer center={mapCenter} zoom={13} style={{ height: "400px", width: "100%" }}>
+        <MapContainer
+          center={mapCenter}
+          zoom={13}
+          // If markers, provide bounds so the map auto-fits otherwise center/zoom is used.
+          {...(bounds ? { bounds, boundsOptions: { padding: [24, 24] as unknown as [number, number] } } : {})}
+          style={{ height: "400px", width: "100%" }}
+        >
           <TileLayer
-            attribution='&copy; <a href="https://www.openstreetmap.org/">OpenStreetMap</a>'
+            attribution='&copy; <a href="https://www.openstreetmap.org/" target="_blank" rel="noreferrer">OpenStreetMap</a>'
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
           {markers.map((pos, i) => (
-            <Marker key={i} position={pos} {...(defaultIcon ? { icon: defaultIcon } : {})}>
-              <Popup>{points ? points[i]?.title : plan[i]}</Popup>
+            <Marker key={`${pos[0].toFixed(6)},${pos[1].toFixed(6)}-${i}`} position={pos} {...(defaultIcon ? { icon: defaultIcon } : {})}>
+              <Popup>
+                {/* Prefer real item titles if provided otherwise fall back to generated plan names */}
+                {points && points[i] ? points[i].title : plan[i] ?? "Place"}
+              </Popup>
             </Marker>
           ))}
         </MapContainer>

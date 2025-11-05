@@ -1,6 +1,7 @@
 "use client";
 
-import { useState } from "react";
+import { useFavorites, makeFavKey } from "./hooks/useFavorites";
+import { useMemo, useState } from "react";
 import MapView from "./MapView";
 import { LineSkeleton, BlockSkeleton } from "./Skeleton";
 
@@ -14,7 +15,7 @@ type PlanItem = {
   lon?: number;
   lng?: number;
   url?: string;
-  source?: string;
+  source?: string; // e.g., "YELP", "TICKETMASTER", "EVENTBRITE"
   venue?: string;
   address?: string;
   whenISO?: string;
@@ -112,6 +113,24 @@ async function copyToClipboard(text: string): Promise<boolean> {
   }
 }
 
+/** Normalize provider string from PlanItem.source -> "YELP" | "EVENT" (Ticketmaster/Eventbrite collapse to EVENT) */
+function providerFromSource(src?: string): "YELP" | "EVENT" {
+  const s = (src ?? "").toUpperCase();
+  if (s.includes("YELP")) return "YELP";
+  return "EVENT"; // Ticketmaster/Eventbrite/other events
+}
+
+/** Build a stable favorite key using provider + (url || title+coords) */
+function favKeyFromItem(p: PlanItem): string {
+  const provider = providerFromSource(p.source);
+  const lonVal = typeof p.lng === "number" ? p.lng : p.lon;
+  const idLike =
+    p.url && p.url.length > 0
+      ? p.url
+      : `${p.title}|${typeof p.lat === "number" ? p.lat : "?"},${typeof lonVal === "number" ? lonVal : "?"}`;
+  return makeFavKey(provider, idLike);
+}
+
 export default function UserForm() {
   const [formData, setFormData] = useState({
     date: "",
@@ -130,6 +149,10 @@ export default function UserForm() {
   const [infoMsg, setInfoMsg] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [mapCenter, setMapCenter] = useState<{ lat: number; lon: number } | undefined>(undefined);
+
+  // Favorites hook + view toggle
+  const { isFavorite, toggleFavorite } = useFavorites();
+  const [showOnlyFavorites, setShowOnlyFavorites] = useState<"ALL" | "FAV">("ALL");
 
   function handleChange(e: React.ChangeEvent<HTMLInputElement>) {
     const { name, value } = e.target;
@@ -160,6 +183,7 @@ export default function UserForm() {
         body: JSON.stringify(payload),
       });
 
+      // Even error responses are JSON by backend design
       const data: unknown = await res.json();
 
       if (!res.ok) {
@@ -188,6 +212,13 @@ export default function UserForm() {
       setTimeout(() => setInfoMsg(null), 1200);
     }
   }
+
+  // Compute the currently visible list depending on Favorites filter
+  const visiblePoints: PlanItem[] = useMemo(() => {
+    const list = points ?? [];
+    if (showOnlyFavorites === "ALL") return list;
+    return list.filter((p) => isFavorite(favKeyFromItem(p)));
+  }, [points, showOnlyFavorites, isFavorite]);
 
   // simple About/How it works card
   const [showAbout, setShowAbout] = useState(false);
@@ -318,8 +349,9 @@ export default function UserForm() {
         <button
           type="submit"
           disabled={loading}
-          className={`py-2 rounded-lg transition text-white ${loading ? "bg-blue-300 cursor-not-allowed" : "bg-blue-600 hover:bg-blue-700"
-            }`}
+          className={`py-2 rounded-lg transition text-white ${
+            loading ? "bg-blue-300 cursor-not-allowed" : "bg-blue-600 hover:bg-blue-700"
+          }`}
         >
           {loading ? "Generating..." : "Generate Plan"}
         </button>
@@ -341,88 +373,140 @@ export default function UserForm() {
         <>
           {/* List card */}
           <div className="mt-6 bg-white p-4 rounded-xl shadow-md">
-            <h3 className="text-lg font-bold mb-2 text-center text-gray-700">
-              Your Hidden Day Plan ✨
-            </h3>
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="text-lg font-bold text-gray-700">Your Hidden Day Plan ✨</h3>
+              {/* Show: All / Favorites toggle */}
+              <div className="inline-flex rounded-2xl border border-gray-200 overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setShowOnlyFavorites("ALL")}
+                  className={`px-3 py-1 text-sm ${
+                    showOnlyFavorites === "ALL" ? "bg-gray-100" : "bg-transparent"
+                  }`}
+                  aria-pressed={showOnlyFavorites === "ALL"}
+                >
+                  All
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowOnlyFavorites("FAV")}
+                  className={`px-3 py-1 text-sm ${
+                    showOnlyFavorites === "FAV" ? "bg-gray-100" : "bg-transparent"
+                  }`}
+                  aria-pressed={showOnlyFavorites === "FAV"}
+                >
+                  Favorites
+                </button>
+              </div>
+            </div>
 
             {/* Empty state */}
-            {(!points || points.length === 0) && (
+            {(!visiblePoints || visiblePoints.length === 0) && (
               <div className="text-center text-gray-600 py-6">
                 <p className="font-medium">No results found.</p>
                 <p className="text-sm">
-                  Try fewer filters, widen the time window, or turn off “Open now”.
+                  {showOnlyFavorites === "FAV"
+                    ? "You have no favorites for this plan yet. Star some items first."
+                    : "Try fewer filters, widen the time window, or turn off “Open now”."
+                  }
                 </p>
               </div>
             )}
 
             {/* Items */}
-            <ul className="list-disc pl-5 text-gray-700 mb-4 space-y-3">
-              {(points ?? []).map((p, i) => {
+            <ul className="list-none pl-0 text-gray-700 mb-4 space-y-3">
+              {visiblePoints.map((p, i) => {
                 const lonVal = p.lng ?? p.lon;
                 const isEvent =
                   (p.source ?? "").toUpperCase().includes("TICKET") ||
                   (p.source ?? "").toUpperCase().includes("EVENT");
+                const favKey = favKeyFromItem(p);
+                const fav = isFavorite(favKey);
 
                 return (
-                  <li key={i} className="marker:text-gray-400">
-                    {/* Title + source badge */}
-                    <div className="flex items-center gap-2 flex-wrap">
-                      {p.url ? (
+                  <li key={`${favKey}-${i}`} className="rounded-2xl border border-gray-200 p-3 flex gap-3">
+                    {/* Star button */}
+                    <button
+                      type="button"
+                      onClick={() => toggleFavorite(favKey)}
+                      className={`shrink-0 h-9 w-9 rounded-full border border-gray-200 grid place-items-center ${
+                        fav ? "bg-yellow-100" : "bg-gray-50"
+                      }`}
+                      title={fav ? "Unstar" : "Star"}
+                      aria-pressed={fav}
+                    >
+                      <svg
+                        viewBox="0 0 24 24"
+                        className="h-5 w-5"
+                        fill={fav ? "currentColor" : "none"}
+                        stroke="currentColor"
+                        strokeWidth="1.5"
+                      >
+                        <path d="M12 17.27l6.18 3.73-1.64-7.19L21 9.24l-7.19-.62L12 2 10.19 8.62 3 9.24l4.46 4.57L5.82 21z" />
+                      </svg>
+                    </button>
+
+                    {/* Content */}
+                    <div className="min-w-0 flex-1">
+                      {/* Title + source badge */}
+                      <div className="flex items-center gap-2 flex-wrap">
+                        {p.url ? (
+                          <a
+                            href={p.url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-blue-600 hover:underline font-medium"
+                          >
+                            {p.title}
+                          </a>
+                        ) : (
+                          <span className="font-medium">{p.title}</span>
+                        )}
+
+                        {p.source && (
+                          <span
+                            className={`ml-1 rounded px-2 py-0.5 text-xs uppercase ${sourceBadgeClass(
+                              p.source
+                            )}`}
+                          >
+                            {isEvent ? "EVENT" : "YELP"}
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Meta line */}
+                      {(p.venue || p.whenISO || p.address) && (
+                        <div className="text-sm text-gray-500">
+                          {p.venue ?? ""}
+                          {p.venue && p.whenISO ? " • " : ""}
+                          {formatWhen(p.whenISO)}
+                          {p.address ? ` • ${p.address}` : ""}
+                        </div>
+                      )}
+
+                      {/* Actions */}
+                      <div className="mt-1 flex gap-3 text-sm">
+                        {p.url && (
+                          <button
+                            type="button"
+                            className="text-gray-600 hover:text-gray-900 underline-offset-2 hover:underline"
+                            onClick={async () => {
+                              const ok = await copyToClipboard(p.url!);
+                              if (!ok) alert("Copy failed");
+                            }}
+                          >
+                            Copy link
+                          </button>
+                        )}
                         <a
-                          href={p.url}
+                          href={mapsHref(p.title, p.address, p.lat, typeof lonVal === "number" ? lonVal : undefined)}
                           target="_blank"
                           rel="noreferrer"
-                          className="text-blue-600 hover:underline font-medium"
-                        >
-                          {p.title}
-                        </a>
-                      ) : (
-                        <span className="font-medium">{p.title}</span>
-                      )}
-
-                      {p.source && (
-                        <span
-                          className={`ml-1 rounded px-2 py-0.5 text-xs uppercase ${sourceBadgeClass(
-                            p.source
-                          )}`}
-                        >
-                          {isEvent ? "EVENT" : "YELP"}
-                        </span>
-                      )}
-                    </div>
-
-                    {/* Meta line */}
-                    {(p.venue || p.whenISO || p.address) && (
-                      <div className="text-sm text-gray-500">
-                        {p.venue ?? ""}
-                        {p.venue && p.whenISO ? " • " : ""}
-                        {formatWhen(p.whenISO)}
-                        {p.address ? ` • ${p.address}` : ""}
-                      </div>
-                    )}
-
-                    {/* Actions */}
-                    <div className="mt-1 flex gap-3 text-sm">
-                      {p.url && (
-                        <button
-                          type="button"
                           className="text-gray-600 hover:text-gray-900 underline-offset-2 hover:underline"
-                          onClick={async () => {
-                            const ok = await copyToClipboard(p.url!);
-                            if (!ok) alert("Copy failed");
-                          }}
                         >
-                          Copy link
-                        </button>
-                      )}
-                      <a
-                        href={mapsHref(p.title, p.address, p.lat, typeof lonVal === "number" ? lonVal : undefined)}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-gray-600 hover:text-gray-900 underline-offset-2 hover:underline"
-                      >
-                        Open in Maps
-                      </a>
+                          Open in Maps
+                        </a>
+                      </div>
                     </div>
                   </li>
                 );
@@ -430,11 +514,11 @@ export default function UserForm() {
             </ul>
           </div>
 
-          {/* Map with loading overlay */}
+          {/* Map with loading overlay — use *visible* points so favorites filter syncs markers */}
           <MapView
             location={formData.location}
             plan={planTitles}
-            points={toMapPoints(points)}
+            points={toMapPoints(visiblePoints)}
             center={mapCenter}
             loading={loading}
           />
